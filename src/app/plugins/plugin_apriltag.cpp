@@ -1,4 +1,5 @@
 #include "plugin_apriltag.h"
+#include "messages_robocup_ssl_detection.pb.h"
 #include <array>
 #include <cstdio>
 #include <image.h>
@@ -8,20 +9,23 @@
 #include <tag36h11.h>
 #include <tagCircle21h7.h>
 #include <tagCircle49h12.h>
+#include <tagCustom20h7.h>
 #include <tagCustom48h12.h>
 #include <tagStandard41h12.h>
 #include <tagStandard52h13.h>
 
 using HammHist = std::array<int, 10>;
 
-PluginAprilTag::PluginAprilTag(FrameBuffer *buffer)
+PluginAprilTag::PluginAprilTag(FrameBuffer *buffer,
+                               const CameraParameters &camera_params)
     : VisionPlugin(buffer), settings(new VarList("AprilTag")),
       v_enable(new VarBool("enable", true)), v_iters(new VarInt("iters", 1)),
       v_threads(new VarInt("threads", 1)), v_hamming(new VarInt("hamming", 1)),
       v_decimate(new VarDouble("decimate", 2.0)),
       v_blur(new VarDouble("blur", 0.0)),
       v_refine_edges(new VarBool("refine-edges", true)),
-      detections{nullptr, &apriltag_detections_destroy} {
+      detections{nullptr, &apriltag_detections_destroy},
+      camera_params(camera_params) {
 
   v_family.reset(new VarStringEnum("Tag Family", "tagCircle21h7"));
   v_family->addItem("tag36h11");
@@ -31,6 +35,7 @@ PluginAprilTag::PluginAprilTag(FrameBuffer *buffer)
   v_family->addItem("tagStandard41h12");
   v_family->addItem("tagStandard52h13");
   v_family->addItem("tagCustom48h12");
+  v_family->addItem("tagCustom20h7");
 
   settings->addChild(v_enable.get());
   settings->addChild(v_family.get());
@@ -99,16 +104,57 @@ ProcessResult PluginAprilTag::process(FrameData *data, RenderOptions *options) {
     detections.reset(apriltag_detector_detect(tag_detector.get(), &im));
     data->map.update("apriltag_detections", detections.get());
 
-    // std::cout << "Found " << zarray_size(detections.get()) << " detections\n";
-    // for (int i = 0; i < zarray_size(detections.get()); ++i) {
-    //   apriltag_detection_t *det;
-    //   zarray_get(detections.get(), i, &det);
+    // add the detections to the robot list so that the positions will
+    // be published
+    SSL_DetectionFrame *detection_frame = 0;
+    detection_frame =
+        (SSL_DetectionFrame *)data->map.get("ssl_detection_frame");
+    if (detection_frame == 0)
+      detection_frame = (SSL_DetectionFrame *)data->map.insert(
+          "ssl_detection_frame", new SSL_DetectionFrame());
 
-    //   printf("detection %3d: id (%2dx%2d)-%-4d, hamming %d, margin %8.3f\n",
-    //   i,
-    //          det->family->nbits, det->family->h, det->id, det->hamming,
-    //          det->decision_margin);
-    // }
+    // add the detections to the detected robots list
+    for (int i = 0; i < zarray_size(detections.get()); ++i) {
+      apriltag_detection_t *det;
+      zarray_get(detections.get(), i, &det);
+
+      // TODO(dschwab): Maybe I should use the included apriltags pose
+      // detection? If it is using the quad info and not just the
+      // image center we would probably get better accuracy when the
+      // camera isn't perfectly orthogonal to the tag.
+
+      vector2d reg_img_center(det->c[0], det->c[1]);
+      vector3d reg_center3d;
+      // TODO(dschwab): Actually get the robot height from the
+      // configured team. For now, this is hardcoded to cmdragons size
+      camera_params.image2field(reg_center3d, reg_img_center, 140);
+
+      // TODO(dschwab): add all the detections to team blue for
+      // now. Should add a config option to assign id to teams and
+      // then use that info here.
+      auto robot_detection = detection_frame->add_robots_blue();
+      robot_detection->set_confidence(100); // TODO(dschwab): What value should I put here?
+      robot_detection->set_robot_id(det->id);
+      robot_detection->set_x(reg_center3d.x);
+      robot_detection->set_y(reg_center3d.y);
+      // TODO(dschwab): Set the orientation
+      robot_detection->set_orientation(0);
+      robot_detection->set_pixel_x(det->c[0]);
+      robot_detection->set_pixel_y(det->c[1]);
+      robot_detection->set_height(140); // TODO(dschwab): Use actual team height
+
+      // printf("Tag %d at (%.3f, %.3f, %.3f)\n", det->id, reg_center3d.x,
+      //        reg_center3d.y, reg_center3d.z);
+      // printf("detection %3d: id (%2dx%2d)-%-4d, hamming %d, margin
+      //            % 8.3f\n ", i,
+      //              det->family->nbits,
+      //        det->family->h, det->id, det->hamming, det->decision_margin);
+    }
+
+    // printf("apriltag found %d blue robots\n",
+    //        detection_frame->robots_blue().size());
+    // printf("apriltag found %d yellow robots\n",
+    //        detection_frame->robots_yellow().size());
   }
 
   return ProcessingOk;
@@ -152,6 +198,10 @@ void PluginAprilTag::makeTagFamily() {
     tag_family = std::unique_ptr<apriltag_family_t,
                                  std::function<void(apriltag_family_t *)>>{
         tagCustom48h12_create(), &tagCustom48h12_destroy};
+  } else if (tag_name == "tagCustom20h7") {
+    tag_family = std::unique_ptr<apriltag_family_t,
+                                 std::function<void(apriltag_family_t *)>>{
+        tagCustom20h7_create(), &tagCustom20h7_destroy};
   } else {
     std::cerr << "AprilTag: Failed to create apriltag family. Unknown family '"
               << tag_name << "'\n";

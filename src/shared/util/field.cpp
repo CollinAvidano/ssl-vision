@@ -290,7 +290,7 @@ RoboCupField::RoboCupField() {
   num_cameras_local = new VarInt(
        "Local Number of Cameras", FieldConstantsRoboCup2018A::kNumCamerasLocal);
 
-  updateShapes = new VarTrigger("Field Lines/Arcs","Update");
+  updateShapes = new VarTrigger("Field Lines/Arcs","Use Defaults");
   var_num_lines = new VarInt("Number of Line Segments", 0);
   var_num_arcs = new VarInt("Number of Arcs", 0);
   field_lines_list = new VarList("Field Lines");
@@ -323,7 +323,6 @@ RoboCupField::RoboCupField() {
   connect(field_arcs_list, SIGNAL(XMLwasRead(VarType*)),
           this, SLOT(ProcessNewFieldArcs()));
 
-    updateFieldLinesAndArcs();
   emit calibrationChanged();
 }
 

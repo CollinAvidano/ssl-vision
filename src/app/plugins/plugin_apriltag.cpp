@@ -1,5 +1,7 @@
 #include "plugin_apriltag.h"
 #include "messages_robocup_ssl_detection.pb.h"
+#include <Eigen/Dense>
+#include <apriltag_pose.h>
 #include <array>
 #include <cstdio>
 #include <image.h>
@@ -14,7 +16,15 @@
 #include <tagStandard41h12.h>
 #include <tagStandard52h13.h>
 
+#define DBG_MACRO_DISABLE
+#include <dbg.h>
+
 using HammHist = std::array<int, 10>;
+using Eigen::AngleAxisd;
+using Eigen::Isometry3d;
+using Eigen::Matrix3d;
+using Eigen::Quaterniond;
+using Eigen::Vector3d;
 
 PluginAprilTag::PluginAprilTag(FrameBuffer *buffer,
                                const CameraParameters &camera_params)
@@ -114,6 +124,108 @@ ProcessResult PluginAprilTag::process(FrameData *data, RenderOptions *options) {
           "ssl_detection_frame", new SSL_DetectionFrame());
 
     // add the detections to the detected robots list
+    apriltag_detection_info_t info;
+    info.tagsize = 0.07; // in meters
+    info.fx = camera_params.focal_length->getDouble();
+    info.fy = camera_params.focal_length->getDouble();
+    info.cx = camera_params.principal_point_x->getDouble();
+    info.cy = camera_params.principal_point_y->getDouble();
+
+    const Isometry3d field_to_cam_transform = [&]() {
+      const Vector3d cam_pos{camera_params.tx->getDouble(),
+                             camera_params.ty->getDouble(),
+                             camera_params.tz->getDouble()};
+      Quaterniond cam_quat{
+          camera_params.q0->getDouble(), camera_params.q1->getDouble(),
+          camera_params.q2->getDouble(), camera_params.q3->getDouble()};
+      cam_quat.norm();
+
+      Isometry3d cam_transform;
+      cam_transform.fromPositionOrientationScale(
+          cam_pos, cam_quat, /*cam_scale*/ Vector3d::Constant(1));
+      return cam_transform;
+    }();
+
+    const AngleAxisd cam_to_aprilcam_rot{M_PI, Vector3d::UnitZ()};
+    const Isometry3d field_to_aprilcam_transform =
+        field_to_cam_transform * cam_to_aprilcam_rot;
+    const Isometry3d aprilcam_to_field_transform =
+        field_to_aprilcam_transform.inverse();
+    const Vector3d tag_to_floor_trans{0, 0, 0};
+
+    // // DEBUG ROBOTS
+    // // Used to check coordinate transforms in vision client as fixed references
+
+    // // CP0
+    // {
+    //   auto robot_detection = detection_frame->add_robots_yellow();
+    //   robot_detection->set_confidence(100);
+    //   robot_detection->set_robot_id(0);
+    //   robot_detection->set_x(-2577);
+    //   robot_detection->set_y(-1655);
+    //   robot_detection->set_orientation(0);
+    //   robot_detection->set_pixel_x(0);
+    //   robot_detection->set_pixel_y(0);
+    // }
+    // // CP1
+    // {
+    //   auto robot_detection = detection_frame->add_robots_yellow();
+    //   robot_detection->set_confidence(100);
+    //   robot_detection->set_robot_id(1);
+    //   robot_detection->set_x(0);
+    //   robot_detection->set_y(-1655);
+    //   robot_detection->set_orientation(M_PI / 3);
+    //   robot_detection->set_pixel_x(0);
+    //   robot_detection->set_pixel_y(0);
+    // }
+    // // CP2
+    // {
+    //   auto robot_detection = detection_frame->add_robots_yellow();
+    //   robot_detection->set_confidence(100);
+    //   robot_detection->set_robot_id(2);
+    //   robot_detection->set_x(2577);
+    //   robot_detection->set_y(-1655);
+    //   robot_detection->set_orientation(2 * M_PI / 3);
+    //   robot_detection->set_pixel_x(0);
+    //   robot_detection->set_pixel_y(0);
+    // }
+    // // CP3
+    // {
+    //   auto robot_detection = detection_frame->add_robots_yellow();
+    //   robot_detection->set_confidence(100);
+    //   robot_detection->set_robot_id(3);
+    //   robot_detection->set_x(2577);
+    //   robot_detection->set_y(0);
+    //   robot_detection->set_orientation(M_PI);
+    //   robot_detection->set_pixel_x(0);
+    //   robot_detection->set_pixel_y(0);
+    // }
+    // // CP4
+    // {
+    //   auto robot_detection = detection_frame->add_robots_yellow();
+    //   robot_detection->set_confidence(100);
+    //   robot_detection->set_robot_id(4);
+    //   robot_detection->set_x(0);
+    //   robot_detection->set_y(0);
+    //   robot_detection->set_orientation(4 * M_PI / 3);
+    //   robot_detection->set_pixel_x(0);
+    //   robot_detection->set_pixel_y(0);
+    // }
+    // // CP5
+    // {
+    //   auto robot_detection = detection_frame->add_robots_yellow();
+    //   robot_detection->set_confidence(100);
+    //   robot_detection->set_robot_id(5);
+    //   robot_detection->set_x(-2577);
+    //   robot_detection->set_y(0);
+    //   robot_detection->set_orientation(5 * M_PI / 3);
+    //   robot_detection->set_pixel_x(0);
+    //   robot_detection->set_pixel_y(0);
+    // }
+    // std::cout << "camera translation:\n"
+    //           << cam_transform.translation() << "\ncam rotation:\n"
+    //           << cam_transform.rotation() << "\n";
+
     for (int i = 0; i < zarray_size(detections.get()); ++i) {
       apriltag_detection_t *det;
       zarray_get(detections.get(), i, &det);
@@ -122,23 +234,65 @@ ProcessResult PluginAprilTag::process(FrameData *data, RenderOptions *options) {
       // detection? If it is using the quad info and not just the
       // image center we would probably get better accuracy when the
       // camera isn't perfectly orthogonal to the tag.
+      info.det = det;
+      apriltag_pose_t pose;
+      estimate_tag_pose(&info, &pose);
+      dbg(det->id);
+
+      const Isometry3d aprilcam_to_tag_transform = [&]() {
+        const Vector3d tag_pos{1000.0 * pose.t->data[0],
+                               1000.0 * pose.t->data[1],
+                               1000.0 * pose.t->data[2]};
+        Matrix3d tag_rot;
+        tag_rot << pose.R->data[0], pose.R->data[1], pose.R->data[2],
+            pose.R->data[3], pose.R->data[4], pose.R->data[5], pose.R->data[6],
+            pose.R->data[7], pose.R->data[8];
+
+        Isometry3d tag_transform;
+        tag_transform.fromPositionOrientationScale(
+            tag_pos, tag_rot,
+            /*tag_scale*/ Vector3d::Constant(1));
+        return tag_transform;
+      }();
+
+      const Vector3d tag_pos_in_aprilcam{1000.0 * pose.t->data[0],
+                                         1000.0 * pose.t->data[1],
+                                         1000.0 * pose.t->data[2]};
+
+      Matrix3d tag_rot_in_aprilcam;
+      tag_rot_in_aprilcam << pose.R->data[0], pose.R->data[1], pose.R->data[2],
+          pose.R->data[3], pose.R->data[4], pose.R->data[5], pose.R->data[6],
+          pose.R->data[7], pose.R->data[8];
+      const Matrix3d tag_rot_in_field =
+          aprilcam_to_field_transform.linear() * tag_rot_in_aprilcam;
+
+      const Vector3d tag_x_in_field = tag_rot_in_field.col(0);
+      dbg(tag_rot_in_field);
+      dbg(tag_x_in_field);
+
+      const double angle =
+          atan2(tag_x_in_field[1], tag_x_in_field[0]) + M_PI / 2.0;
 
       vector2d reg_img_center(det->c[0], det->c[1]);
       vector3d reg_center3d;
       // TODO(dschwab): Actually get the robot height from the
       // configured team. For now, this is hardcoded to cmdragons size
       camera_params.image2field(reg_center3d, reg_img_center, 140);
-
+      
       // TODO(dschwab): add all the detections to team blue for
       // now. Should add a config option to assign id to teams and
       // then use that info here.
       auto robot_detection = detection_frame->add_robots_blue();
-      robot_detection->set_confidence(100); // TODO(dschwab): What value should I put here?
+      // printf("%d: hamming: %d, decision_margin: %f\n", det->id, det->hamming,
+      //        det->decision_margin);
+      robot_detection->set_confidence(
+          det->decision_margin); // TODO(dschwab): What value should I put here?
       robot_detection->set_robot_id(det->id);
+      // robot_detection->set_x(tag_pos_in_field.x());
+      // robot_detection->set_y(tag_pos_in_field.y());
       robot_detection->set_x(reg_center3d.x);
       robot_detection->set_y(reg_center3d.y);
-      // TODO(dschwab): Set the orientation
-      robot_detection->set_orientation(0);
+      robot_detection->set_orientation(angle);
       robot_detection->set_pixel_x(det->c[0]);
       robot_detection->set_pixel_y(det->c[1]);
       robot_detection->set_height(140); // TODO(dschwab): Use actual team height

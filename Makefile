@@ -8,7 +8,7 @@ all: build_cmake
 $(buildDir)/CMakeLists.txt.copy: CMakeLists.txt
 	mkdir -p $(buildDir) && \
 	cd $(buildDir) && \
-	cmake -DCMAKE_BUILD_TYPE=$(buildType) .. && \
+	cmake -DUSE_APRILTAG=ON -DCMAKE_BUILD_TYPE=$(buildType) .. && \
 	cp ../CMakeLists.txt ./CMakeLists.txt.copy
 
 build_cmake: $(buildDir)/CMakeLists.txt.copy
